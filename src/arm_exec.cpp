@@ -6536,6 +6536,10 @@ static std::atomic<bool> g_process_stopping{false};
  * of the handler that ends the wait. */
 static bool     g_main_waiting_signal = false;
 static uint64_t g_main_sigsuspend_old_mask = 0;
+/* The same for a Java thread attached to the guest (g_dvm_guest_tid): it has
+ * no ArmThread slot either, and runs on its own host thread. */
+static thread_local bool     g_dvm_waiting_signal = false;
+static thread_local uint64_t g_dvm_sigsuspend_old_mask = 0;
 
 static uint32_t guest_pid(void)
 {
@@ -36338,6 +36342,35 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                             t->id, (unsigned long long)mask);
                 break;
             }
+            /* A Java thread attached to the guest has no slot either, and
+             * its signals wait in g_dvm_pending_signals until the SVC return
+             * takes them (take_main_signal).  Install the temporary mask once
+             * a signal it lets through is pending, so that signal is taken
+             * and its handler's return restores the mask sigsuspend replaced.
+             * Returning without installing it left a signal the interrupted
+             * handler blocks (Boehm's restart signal, inside its suspend
+             * handler) pending until that handler returned. */
+            if (g_current_tid != 0 && g_current_tid < 4096 &&
+                g_current_tid == g_dvm_guest_tid) {
+                const uint32_t tid = g_current_tid;
+                uint64_t mask = guest_sigset_load(ctx, argp(0),
+                                                  sigset_is_wide(ctx, svc_no));
+                mask &= ~(1ull << (9 - 1));
+                mask &= ~(1ull << (19 - 1));
+                if (g_dvm_pending_signals[tid].load(std::memory_order_acquire) & ~mask) {
+                    if (!g_dvm_waiting_signal)
+                        g_dvm_sigsuspend_old_mask = signal_mask_load(tid);
+                    signal_mask_store(tid, mask);
+                    g_dvm_waiting_signal = true;
+                } else {
+                    /* Nothing to take yet: the caller loops on sigsuspend,
+                     * so give the sender a chance to run. */
+                    g_yield_requested = true;
+                }
+                if (uint32_t eva = errno_va(ctx, tid)) ctx.mem.write32(eva, EINTR);
+                ret32(~0u);
+                break;
+            }
             /* The main thread has no slot to park.  Wait here, driving the
              * other threads the way its sleeps do, until a signal the
              * temporary mask lets through is pending; the SVC return then
@@ -56053,6 +56086,7 @@ extern "C" void arm_exec_dvm_thread_attach(void)
 
     g_dvm_pending_signals[tid].store(0, std::memory_order_relaxed);
     g_main_signal_depth = 0;
+    g_dvm_waiting_signal = false;
     g_current_tid = tid;
     if (!g_ctx->is_arm64) g_tpidr32_val = arm32_tls_for_tid(*g_ctx, tid);
     if (g_ctx->is_arm64) {
@@ -56096,6 +56130,7 @@ extern "C" void arm_exec_dvm_thread_detach(void)
     guest_tid_release(tid);
     g_dvm_guest_tid = 0;
     g_main_signal_depth = 0;
+    g_dvm_waiting_signal = false;
     g_dvm_guest_tls = 0;
     g_current_tid = 0;
     if (g_ctx->is_arm64) {
@@ -60728,6 +60763,9 @@ public:
                  * saved_sigmask does. */
                 g_main_waiting_signal = false;
                 frame.old_mask = g_main_sigsuspend_old_mask;
+            } else if (g_current_tid != 0 && g_dvm_waiting_signal) {
+                g_dvm_waiting_signal = false;
+                frame.old_mask = g_dvm_sigsuspend_old_mask;
             }
             ++*depth;
             uint64_t blocked = cur_mask | sa.mask;
