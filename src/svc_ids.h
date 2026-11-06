@@ -1990,6 +1990,7 @@ enum SvcId : uint32_t {
     SVC_GL3_VertexAttribI4iv,
     SVC_GL3_VertexAttribI4uiv,
     SVC_GL3_WaitSync,
+    SVC_LIBC_CREAT,
     SVC_TRAMP_TOTAL,
 };
 
